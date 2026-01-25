@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+biopython
+rdkit
+meeko
+vina
+stmol
+py3Dmol
+openpyxl
+requests
