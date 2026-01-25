@@ -10,3 +10,4 @@ py3Dmol
 openpyxl
 requests
 scipy
+gemmi
