@@ -11,4 +11,4 @@ openpyxl
 requests
 scipy
 gemmi
-ipython
+ipython_genutils
