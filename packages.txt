@@ -1,1 +1,4 @@
 openbabel
+libboost-all-dev
+swig
+build-essential
