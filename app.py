@@ -53,7 +53,7 @@ st.markdown("""
 
 # Check for OpenBabel
 if not check_openbabel():
-    st.error("⚠️ System Error: 'openbabel' is not installed. If on Streamlit Cloud, ensure 'packages.txt' contains 'openbabel'.")
+    st.error("⚠️ System Error: 'openbabel' is not installed. If on Streamlit Cloud, ensure 'packages.txt' contains 'openbabel', 'libboost-all-dev', 'swig', and 'build-essential'.")
 
 # 1. SIDEBAR: DATA INPUT
 with st.sidebar:
@@ -149,7 +149,23 @@ if pdb_id:
         view.addModel(open(pdb_path).read(), 'pdb')
         view.setStyle({'cartoon': {'color': 'white'}})
         view.addStyle({'resn': target_ligand['Value'][1], 'resi': target_ligand['Value'][2]}, {'stick': {'colorscheme': 'greenCarbon', 'radius': 0.5}})
-        view.addBox({'center': {'x':center[0], 'y':center[1], 'z':center[2]}, 'dimensions': {'w':box_size, 'h':box_size, 'd':box_size}, 'color':'red', 'opacity': 0.5})
+        
+        # --- SAFE FLOAT CONVERSION ---
+        # Explicitly convert numpy floats to standard python floats for JSON serialization
+        safe_center = {
+            'x': float(center[0]), 
+            'y': float(center[1]), 
+            'z': float(center[2])
+        }
+        
+        view.addBox({
+            'center': safe_center, 
+            'dimensions': {'w': box_size, 'h': box_size, 'd': box_size}, 
+            'color': 'red', 
+            'opacity': 0.5
+        })
+        # -----------------------------
+        
         view.zoomTo()
         showmol(view, height=400, width=800)
 
@@ -177,7 +193,7 @@ if pdb_id:
             try:
                 subprocess.run(cmd, check=True)
             except subprocess.CalledProcessError:
-                st.error("Failed to convert receptor to PDBQT.")
+                st.error("Failed to convert receptor to PDBQT. Ensure OpenBabel is installed.")
                 st.stop()
 
             results_table = []
@@ -193,23 +209,26 @@ if pdb_id:
                 try:
                     # RDKit Setup
                     mol = Chem.MolFromSmiles(smi)
-                    mol = Chem.AddHs(mol)
-                    AllChem.EmbedMolecule(mol)
-                    
-                    # Meeko PDBQT prep
-                    meeko_prep = MoleculePreparation()
-                    meeko_prep.prepare(mol)
-                    ligand_pdbqt = meeko_prep.write_pdbqt_string()
-                    
-                    # Vina Docking
-                    v = Vina(sf_name='vina')
-                    v.set_receptor(receptor_pdbqt_path)
-                    v.set_ligand_from_string(ligand_pdbqt)
-                    v.compute_vina_maps(center=center, box_size=[box_size, box_size, box_size])
-                    v.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)
-                    
-                    score = v.score()[0]
-                    results_table.append({'Name': name, 'Affinity (kcal/mol)': score, 'SMILES': smi})
+                    if mol:
+                        mol = Chem.AddHs(mol)
+                        AllChem.EmbedMolecule(mol)
+                        
+                        # Meeko PDBQT prep
+                        meeko_prep = MoleculePreparation()
+                        meeko_prep.prepare(mol)
+                        ligand_pdbqt = meeko_prep.write_pdbqt_string()
+                        
+                        # Vina Docking
+                        v = Vina(sf_name='vina')
+                        v.set_receptor(receptor_pdbqt_path)
+                        v.set_ligand_from_string(ligand_pdbqt)
+                        v.compute_vina_maps(center=center, box_size=[box_size, box_size, box_size])
+                        v.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)
+                        
+                        score = v.score()[0]
+                        results_table.append({'Name': name, 'Affinity (kcal/mol)': score, 'SMILES': smi})
+                    else:
+                        st.warning(f"Invalid SMILES for {name}")
                     
                 except Exception as e:
                     print(f"Error docking {name}: {e}")
@@ -217,11 +236,14 @@ if pdb_id:
                 progress_bar.progress((i + 1) / total_mols)
             
             status_text.text("Done!")
-            res_df = pd.DataFrame(results_table).sort_values(by='Affinity (kcal/mol)')
             
-            st.subheader("Results")
-            st.dataframe(res_df)
-            
-            # Download CSV
-            csv = res_df.to_csv(index=False).encode('utf-8')
-            st.download_button("Download Results CSV", csv, "docking_results.csv", "text/csv")
+            if results_table:
+                res_df = pd.DataFrame(results_table).sort_values(by='Affinity (kcal/mol)')
+                st.subheader("Results")
+                st.dataframe(res_df)
+                
+                # Download CSV
+                csv = res_df.to_csv(index=False).encode('utf-8')
+                st.download_button("Download Results CSV", csv, "docking_results.csv", "text/csv")
+            else:
+                st.warning("No docking results generated.")
