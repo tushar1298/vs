@@ -67,12 +67,6 @@ class WaterRemover(Select):
     def accept_residue(self, residue):
         return 0 if residue.get_resname() == "HOH" else 1
 
-def check_system_dependencies():
-    if shutil.which("obabel") is None:
-        st.error("❌ Critical Error: **OpenBabel** is not installed on this system.")
-        st.info("If running on Streamlit Cloud, add `openbabel` to your `packages.txt`.")
-        st.stop()
-
 def get_geometric_center(residue):
     """Calculates the center of mass for a specific residue."""
     coords = [atom.get_coord() for atom in residue]
@@ -156,9 +150,6 @@ def calculate_properties(mol, affinity):
 st.title("🧬 NucLigs Pro: Bio-Physics Screening Engine")
 st.markdown("A high-precision tool for virtual screening of nucleotide analogs using **AutoDock Vina**.")
 
-# Uncomment this line if you have OpenBabel installed on the system
-# check_system_dependencies()
-
 # --- SIDEBAR: INPUTS ---
 with st.sidebar:
     st.header("1. Library Input")
@@ -221,7 +212,6 @@ with st.sidebar:
         st.caption("Draw your molecule below:")
         
         # Ketcher Editor
-        # Default is Benzene if nothing is drawn yet
         drawn_smiles = st_ketcher("c1ccccc1")
         
         col_name, col_add = st.columns([2, 1])
@@ -374,6 +364,7 @@ if pdb_input:
         results_container = st.container()
         progress_bar = st.progress(0)
         status_text = st.empty()
+        error_log = st.expander("⚠️ Error Log (Check if results are empty)", expanded=False)
         
         # A. PREPARE RECEPTOR
         status_text.text("⚙️ Preparing Receptor Topology...")
@@ -385,23 +376,28 @@ if pdb_input:
         
         # Select cleaning strategy based on mode
         if docking_mode == "Active Site (Ligand-Guided)":
-            # Remove specific ligand + water
             io.save(clean_pdb, LigandRemover(target_site_id))
         else:
-            # Blind: Just remove water, keep co-factors/ions if any
             io.save(clean_pdb, WaterRemover())
         
+        # SYSTEM CHECK: OPENBABEL
+        if shutil.which("obabel") is None:
+            st.error("❌ Critical Error: **OpenBabel** is not installed on this system.")
+            st.info("If running on Streamlit Cloud, add `openbabel` to your `packages.txt`.")
+            st.stop()
+            
         try:
             subprocess.run([
                 "obabel", clean_pdb, "-O", receptor_pdbqt, "-xr", "--partialcharge", "gasteiger"
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
-            st.error("OpenBabel conversion failed. Make sure 'openbabel' is installed in packages.txt")
+            st.error("OpenBabel conversion failed.")
             st.stop()
 
         # B. DOCKING LOOP
         results = []
         total = len(df)
+        success_count = 0
         
         for i, row in df.iterrows():
             name = row.get('name', f"Mol_{i}")
@@ -425,31 +421,38 @@ if pdb_input:
                 v = Vina(sf_name='vina')
                 v.set_receptor(receptor_pdbqt)
                 v.set_ligand_from_string(ligand_pdbqt)
-                # Ensure box dimensions are passed correctly as list
-                v.compute_vina_maps(center=center, box_size=[float(d) for d in box_dim])
+                
+                # --- CRITICAL FIX: Ensure these are lists of floats, not NumPy arrays ---
+                safe_center = [float(c) for c in center]
+                safe_box_dim = [float(d) for d in box_dim]
+                
+                v.compute_vina_maps(center=safe_center, box_size=safe_box_dim)
                 v.dock(exhaustiveness=exhaustiveness, n_poses=1)
                 
                 # 4. Analyze
-                affinity = v.score()[0]
-                le, lipinski, mw, logp = calculate_properties(mol, affinity)
-                interactions = analyze_interactions(structure[0], v.poses(n_poses=1))
-                
-                results.append({
-                    "Name": name,
-                    "Affinity (kcal/mol)": affinity,
-                    "Ligand Efficiency": le,
-                    "Drug-Likeness": lipinski,
-                    "Interacting Residues": interactions,
-                    "MW": mw,
-                    "LogP": logp
-                })
+                if len(v.score()) > 0:
+                    affinity = v.score()[0]
+                    le, lipinski, mw, logp = calculate_properties(mol, affinity)
+                    interactions = analyze_interactions(structure[0], v.poses(n_poses=1))
+                    
+                    results.append({
+                        "Name": name,
+                        "Affinity (kcal/mol)": affinity,
+                        "Ligand Efficiency": le,
+                        "Drug-Likeness": lipinski,
+                        "Interacting Residues": interactions,
+                        "MW": mw,
+                        "LogP": logp
+                    })
+                    success_count += 1
                 
             except Exception as e:
-                print(f"Failed {name}: {e}")
+                # Log errors to the expander so we can see what went wrong
+                error_log.write(f"❌ **{name}** Failed: `{str(e)}`")
             
             progress_bar.progress((i + 1) / total)
 
-        status_text.text("✅ Simulation Complete!")
+        status_text.text(f"✅ Simulation Complete! ({success_count}/{total} successful)")
         
         if results:
             res_df = pd.DataFrame(results).sort_values(by="Affinity (kcal/mol)")
@@ -460,7 +463,7 @@ if pdb_input:
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Top Affinity", f"{best_mol['Affinity (kcal/mol)']:.2f} kcal/mol")
                 m2.metric("Best Efficiency", f"{res_df['Ligand Efficiency'].max():.2f}")
-                m3.metric("Molecules Screened", total)
+                m3.metric("Molecules Screened", f"{success_count}/{total}")
                 
                 st.dataframe(
                     res_df.style.background_gradient(subset=['Affinity (kcal/mol)'], cmap='viridis_r')
@@ -471,4 +474,4 @@ if pdb_input:
                 csv = res_df.to_csv(index=False).encode('utf-8')
                 st.download_button("📥 Download Results", csv, "screening_results.csv", "text/csv")
         else:
-            st.warning("No valid results generated.")
+            st.error("🚫 No results generated. Please check the 'Error Log' above.")
