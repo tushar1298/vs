@@ -53,33 +53,57 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # 2. HELPER CLASSES & FUNCTIONS
 # ============================================
 
-class PocketSelector(Select):
-    """Selects everything EXCEPT specific residues (used to remove native ligands)."""
+class LigandRemover(Select):
+    """Specific Removal: Keeps everything EXCEPT the selected residue."""
     def __init__(self, res_to_exclude):
-        self.res_to_exclude = res_to_exclude # (Chain, ResName, ResID)
-        
+        self.res_to_exclude = res_to_exclude 
     def accept_residue(self, residue):
         unique_id = (residue.get_parent().id, residue.get_resname(), residue.get_id()[1])
         return 0 if unique_id == self.res_to_exclude else 1
 
+class WaterRemover(Select):
+    """Blind Cleaning: Removes HOH (Water) but keeps everything else."""
+    def accept_residue(self, residue):
+        return 0 if residue.get_resname() == "HOH" else 1
+
 def check_system_dependencies():
-    """Ensures OpenBabel is installed for Receptor preparation."""
     if shutil.which("obabel") is None:
         st.error("❌ Critical Error: **OpenBabel** is not installed on this system.")
         st.info("If running on Streamlit Cloud, add `openbabel` to your `packages.txt`.")
         st.stop()
 
 def get_geometric_center(residue):
-    """Calculates the center of mass for a residue."""
+    """Calculates the center of mass for a specific residue."""
     coords = [atom.get_coord() for atom in residue]
     return np.mean(coords, axis=0)
 
+def get_whole_protein_bbox(structure):
+    """
+    Calculates the center and size of the ENTIRE protein for Blind Docking.
+    Returns: center (x,y,z), dimensions (w,h,d)
+    """
+    coords = []
+    for model in structure:
+        for chain in model:
+            for res in chain:
+                # Use standard amino acids to define the protein box
+                if res.get_id()[0] == ' ': 
+                    for atom in res:
+                        coords.append(atom.get_coord())
+    
+    if not coords: return np.array([0,0,0]), np.array([20,20,20])
+    
+    coords = np.array(coords)
+    min_coord = np.min(coords, axis=0)
+    max_coord = np.max(coords, axis=0)
+    
+    center = (max_coord + min_coord) / 2
+    size = (max_coord - min_coord) + 10 # Add 10 Angstrom padding
+    
+    return center, size
+
 def analyze_interactions(receptor_model, ligand_pdbqt_string, cutoff=4.0):
-    """
-    Physics-based contact analysis.
-    Returns: List of residues interacting with the ligand.
-    """
-    # 1. Extract Receptor Coordinates
+    """Physics-based contact analysis."""
     rec_coords = []
     rec_labels = []
     for chain in receptor_model:
@@ -90,12 +114,10 @@ def analyze_interactions(receptor_model, ligand_pdbqt_string, cutoff=4.0):
                     rec_labels.append(f"{res.get_resname()}{res.get_id()[1]}")
     rec_coords = np.array(rec_coords)
 
-    # 2. Extract Ligand Coordinates from PDBQT
     lig_coords = []
     for line in ligand_pdbqt_string.split('\n'):
         if line.startswith(("ATOM", "HETATM")):
             try:
-                # PDBQT columns for X, Y, Z
                 x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
                 lig_coords.append([x, y, z])
             except ValueError:
@@ -104,10 +126,7 @@ def analyze_interactions(receptor_model, ligand_pdbqt_string, cutoff=4.0):
 
     if len(lig_coords) == 0: return "N/A"
 
-    # 3. Distance Matrix Calculation
     dists = distance.cdist(lig_coords, rec_coords, 'euclidean')
-    
-    # 4. Filter by Cutoff (Van der Waals contact)
     interacting_indices = np.where(dists < cutoff)[1]
     unique_contacts = sorted(list(set([rec_labels[i] for i in interacting_indices])))
     
@@ -118,12 +137,8 @@ def calculate_properties(mol, affinity):
     heavy_atoms = mol.GetNumHeavyAtoms()
     mw = Descriptors.MolWt(mol)
     logp = Descriptors.MolLogP(mol)
-    
-    # Physics Metric: Ligand Efficiency (LE)
-    # Target: > 0.3 kcal/mol per heavy atom
     le = (-affinity / heavy_atoms) if heavy_atoms > 0 else 0
     
-    # Biological Metric: Lipinski Violations
     violations = 0
     if mw > 500: violations += 1
     if logp > 5: violations += 1
@@ -131,7 +146,6 @@ def calculate_properties(mol, affinity):
     if Descriptors.NumHAcceptors(mol) > 10: violations += 1
     
     status = "✅ Pass" if violations <= 1 else f"⚠️ {violations} Violations"
-    
     return round(le, 2), status, round(mw, 1), round(logp, 2)
 
 # ============================================
@@ -139,23 +153,37 @@ def calculate_properties(mol, affinity):
 # ============================================
 
 st.title("🧬 NucLigs Pro: Bio-Physics Screening Engine")
-st.markdown("A high-precision tool for virtual screening of nucleotide analogs using **AutoDock Vina** and **Interaction Fingerprinting**.")
+st.markdown("A high-precision tool for virtual screening of nucleotide analogs using **AutoDock Vina**.")
 
 check_system_dependencies()
 
 # --- SIDEBAR: INPUTS ---
 with st.sidebar:
     st.header("1. Library Input")
-    uploaded_file = st.file_uploader("Upload Metadata (Excel)", type=['xlsx'])
+    uploaded_file = st.file_uploader("Upload Library (Excel, CSV, TXT)", type=['xlsx', 'csv', 'txt'])
     
     if uploaded_file:
-        df = pd.read_excel(uploaded_file)
-        # Normalize columns
-        df.columns = [c.lower().strip() for c in df.columns]
-        if 'smiles' not in df.columns:
-            st.error("Excel must contain a 'smiles' column.")
+        try:
+            file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+            if file_ext == '.xlsx':
+                df = pd.read_excel(uploaded_file)
+            else:
+                df = pd.read_csv(uploaded_file, sep=None, engine='python')
+                
+            df.columns = [str(c).lower().strip() for c in df.columns]
+            
+            if 'smiles' not in df.columns:
+                if len(df.columns) == 1:
+                    df.columns = ['smiles']
+                    st.info("ℹ️ No header found. Assuming single column is SMILES.")
+                else:
+                    st.error("❌ Input file must contain a 'smiles' column.")
+                    st.stop()
+            st.success(f"✅ Loaded {len(df)} molecules.")
+            
+        except Exception as e:
+            st.error(f"❌ Error reading file: {e}")
             st.stop()
-        st.success(f"Loaded {len(df)} molecules.")
     else:
         st.info("Using Demo Library")
         df = pd.DataFrame({
@@ -168,10 +196,21 @@ with st.sidebar:
         })
 
     st.divider()
-    st.header("3. Simulation Settings")
+    st.header("3. Docking Strategy")
+    
+    # DOCKING MODE SELECTOR
+    docking_mode = st.radio(
+        "Screening Mode", 
+        ["Active Site (Ligand-Guided)", "Blind Docking (Whole Surface)"],
+        help="Active Site: Targets a known pocket.\nBlind Docking: Searches the entire protein surface."
+    )
+    
     exhaustiveness = st.slider("Search Exhaustiveness", 1, 32, 8, help="Higher = More accurate but slower.")
-    box_padding = st.slider("Box Padding (Å)", 10, 30, 20, help="Size of the search space around the active site.")
-    contact_dist = st.slider("Contact Cutoff (Å)", 2.5, 5.0, 4.0, help="Max distance to define a residue interaction.")
+    
+    if docking_mode == "Active Site (Ligand-Guided)":
+        box_padding = st.slider("Box Size (Å)", 10, 30, 20)
+    else:
+        st.info("ℹ️ Box size is automatically calculated to cover the whole protein.")
 
 # --- MAIN: RECEPTOR PREP ---
 st.header("2. Target Preparation")
@@ -182,108 +221,122 @@ with col1:
     pdb_input = st.text_input("PDB ID:", "1UA2", help="Enter 4-letter PDB code").strip().lower()
 
 if pdb_input:
-    # Use dynamic filename based on input ID to prevent caching old files
     pdb_filename = f"{pdb_input}.pdb"
     pdb_path = os.path.join(TEMP_DIR, pdb_filename)
     
-    # Fetch PDB
     if not os.path.exists(pdb_path):
-        with st.spinner(f"Downloading {pdb_input.upper()} from RCSB..."):
+        with st.spinner(f"Downloading {pdb_input.upper()}..."):
             try:
-                # Add headers to mimic a browser
                 headers = {'User-Agent': 'Mozilla/5.0'}
                 r = requests.get(f"https://files.rcsb.org/download/{pdb_input}.pdb", headers=headers)
-                
-                if r.status_code != 200:
-                    st.error(f"❌ Error: Could not find PDB ID '{pdb_input.upper()}' on RCSB.")
-                    st.stop()
-                
-                # Check for valid PDB content
-                if "HEADER" not in r.text[:100] and "ATOM" not in r.text[:1000]:
-                     st.error("❌ Invalid file format received from RCSB.")
+                if r.status_code != 200 or "HEADER" not in r.text[:100]:
+                     st.error("❌ Invalid PDB ID or File.")
                      st.stop()
-
                 with open(pdb_path, "w") as f:
                     f.write(r.text)
-                    
             except Exception as e:
                 st.error(f"Connection Error: {e}")
                 st.stop()
     
-    # Parse Structure
     try:
         parser = PDBParser(QUIET=True)
         structure = parser.get_structure(pdb_input, pdb_path)
     except Exception:
-        st.error("❌ Failed to parse PDB file. It might be corrupt.")
+        st.error("❌ Failed to parse PDB file.")
         if os.path.exists(pdb_path): os.remove(pdb_path)
         st.stop()
-    
-    # Identify Potential Pockets (Bound Ligands)
-    ligands = []
-    for model in structure:
-        for chain in model:
-            for res in chain:
-                # H_ prefix denotes Heteroatom (ligand/water)
-                # Exclude common non-ligands like HOH (water), PO4, SO4, etc.
-                if res.get_id()[0].startswith('H_') and res.get_resname() not in ['HOH', 'DOD', 'PO4', 'SO4']:
-                    ligands.append({
-                        'display': f"{res.get_resname()} (Chain {chain.id} {res.get_id()[1]})",
-                        'id': (chain.id, res.get_resname(), res.get_id()[1]),
-                        'center': get_geometric_center(res)
-                    })
-    
-    if not ligands:
-        st.warning(f"No bound ligands found in {pdb_input.upper()}.")
-        st.info("The tool currently requires a bound ligand to define the docking center automatically.")
-        st.stop()
 
-    with col2:
-        selected_lig_idx = st.selectbox(
-            "Select Active Site (Defined by Bound Ligand):", 
-            range(len(ligands)), 
-            format_func=lambda i: ligands[i]['display']
-        )
-        target_site = ligands[selected_lig_idx]
-        center = target_site['center']
+    # --- MODE LOGIC ---
+    target_site_id = None # Used only for exclusion in Guided Mode
+    
+    if docking_mode == "Active Site (Ligand-Guided)":
+        # Identify Bound Ligands
+        ligands = []
+        for model in structure:
+            for chain in model:
+                for res in chain:
+                    if res.get_id()[0].startswith('H_') and res.get_resname() not in ['HOH', 'DOD', 'PO4', 'SO4']:
+                        ligands.append({
+                            'display': f"{res.get_resname()} (Chain {chain.id} {res.get_id()[1]})",
+                            'id': (chain.id, res.get_resname(), res.get_id()[1]),
+                            'center': get_geometric_center(res)
+                        })
+        
+        if not ligands:
+            st.warning(f"No bound ligands found. Switching to Blind Docking might be better.")
+            st.stop()
+
+        with col2:
+            selected_lig_idx = st.selectbox(
+                "Select Pocket (Defined by Bound Ligand):", 
+                range(len(ligands)), 
+                format_func=lambda i: ligands[i]['display']
+            )
+            target_site = ligands[selected_lig_idx]
+            target_site_id = target_site['id']
+            
+            # Set Vina Parameters
+            center = target_site['center']
+            box_dim = [box_padding, box_padding, box_padding] # User defined
+
+    else: # BLIND DOCKING
+        with col2:
+            st.success("🌍 Blind Docking Mode Active")
+            st.markdown("The grid box will encompass the entire protein surface.")
+            
+            # Calculate Whole Protein Box
+            prot_center, prot_size = get_whole_protein_bbox(structure)
+            center = prot_center
+            box_dim = prot_size
+            
+            st.caption(f"Grid Center: {center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}")
+            st.caption(f"Grid Size: {box_dim[0]:.1f} x {box_dim[1]:.1f} x {box_dim[2]:.1f} Å")
 
     # --- VISUALIZATION ---
-    with st.expander("Active Site Visualization", expanded=True):
+    with st.expander("Grid Visualization", expanded=True):
         view = py3Dmol.view(width=800, height=400)
         view.addModel(open(pdb_path).read(), 'pdb')
         view.setStyle({'cartoon': {'color': 'white'}})
         
-        # Highlight Active Site Ligand
-        view.addStyle(
-            {'resn': target_site['id'][1], 'resi': target_site['id'][2], 'chain': target_site['id'][0]}, 
-            {'stick': {'colorscheme': 'greenCarbon', 'radius': 0.5}}
-        )
+        if docking_mode == "Active Site (Ligand-Guided)":
+             view.addStyle(
+                {'resn': target_site['id'][1], 'resi': target_site['id'][2], 'chain': target_site['id'][0]}, 
+                {'stick': {'colorscheme': 'greenCarbon', 'radius': 0.5}}
+            )
         
-        # Show Search Box (Safe Float Conversion for JSON)
+        # Show Grid Box
         safe_center = {'x': float(center[0]), 'y': float(center[1]), 'z': float(center[2])}
         view.addBox({
             'center': safe_center, 
-            'dimensions': {'w': box_padding, 'h': box_padding, 'd': box_padding}, 
-            'color': 'red', 'opacity': 0.4
+            'dimensions': {'w': float(box_dim[0]), 'h': float(box_dim[1]), 'd': float(box_dim[2])}, 
+            'color': 'blue' if docking_mode == "Blind Docking (Whole Surface)" else 'red', 
+            'opacity': 0.4
         })
         view.zoomTo()
         showmol(view, height=400, width=800)
 
     # --- SIMULATION EXECUTION ---
-    if st.button("🚀 Run Physics Screening Engine"):
+    if st.button("🚀 Run Screening"):
         
         results_container = st.container()
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # A. PREPARE RECEPTOR (Clean & Convert)
+        # A. PREPARE RECEPTOR
         status_text.text("⚙️ Preparing Receptor Topology...")
         clean_pdb = os.path.join(TEMP_DIR, "clean_receptor.pdb")
         receptor_pdbqt = os.path.join(TEMP_DIR, "receptor.pdbqt")
         
         io = PDBIO()
         io.set_structure(structure)
-        io.save(clean_pdb, PocketSelector(target_site['id']))
+        
+        # Select cleaning strategy based on mode
+        if docking_mode == "Active Site (Ligand-Guided)":
+            # Remove specific ligand + water
+            io.save(clean_pdb, LigandRemover(target_site_id))
+        else:
+            # Blind: Just remove water, keep co-factors/ions if any
+            io.save(clean_pdb, WaterRemover())
         
         try:
             subprocess.run([
@@ -300,33 +353,33 @@ if pdb_input:
         for i, row in df.iterrows():
             name = row.get('name', f"Mol_{i}")
             smi = row.get('smiles')
-            
             status_text.text(f"⚗️ Simulating: {name}")
             
             try:
-                # 1. 3D Embedding (RDKit)
+                # 1. Embed
                 mol = Chem.MolFromSmiles(smi)
                 if not mol: raise ValueError("Invalid SMILES")
                 mol = Chem.AddHs(mol)
                 if AllChem.EmbedMolecule(mol, maxAttempts=5000) == -1:
-                    AllChem.Compute2DCoords(mol) # Fallback
+                    AllChem.Compute2DCoords(mol)
                 
-                # 2. Ligand Prep (Meeko)
+                # 2. Prep
                 prep = MoleculePreparation()
                 prep.prepare(mol)
                 ligand_pdbqt = prep.write_pdbqt_string()
                 
-                # 3. Docking (Vina)
+                # 3. Dock
                 v = Vina(sf_name='vina')
                 v.set_receptor(receptor_pdbqt)
                 v.set_ligand_from_string(ligand_pdbqt)
-                v.compute_vina_maps(center=center, box_size=[box_padding]*3)
+                # Ensure box dimensions are passed correctly as list
+                v.compute_vina_maps(center=center, box_size=[float(d) for d in box_dim])
                 v.dock(exhaustiveness=exhaustiveness, n_poses=1)
                 
-                # 4. Analysis
+                # 4. Analyze
                 affinity = v.score()[0]
                 le, lipinski, mw, logp = calculate_properties(mol, affinity)
-                interactions = analyze_interactions(structure[0], v.poses(n_poses=1), cutoff=contact_dist)
+                interactions = analyze_interactions(structure[0], v.poses(n_poses=1))
                 
                 results.append({
                     "Name": name,
@@ -345,34 +398,24 @@ if pdb_input:
 
         status_text.text("✅ Simulation Complete!")
         
-        # C. REPORTING
         if results:
             res_df = pd.DataFrame(results).sort_values(by="Affinity (kcal/mol)")
-            
             with results_container:
                 st.subheader("🏆 Screening Results")
                 
-                # Metrics for best hit
                 best_mol = res_df.iloc[0]
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Top Affinity", f"{best_mol['Affinity (kcal/mol)']:.2f} kcal/mol")
                 m2.metric("Best Efficiency", f"{res_df['Ligand Efficiency'].max():.2f}")
                 m3.metric("Molecules Screened", total)
                 
-                # Styled Dataframe
                 st.dataframe(
                     res_df.style.background_gradient(subset=['Affinity (kcal/mol)'], cmap='viridis_r')
                           .background_gradient(subset=['Ligand Efficiency'], cmap='Greens')
                           .format({"Affinity (kcal/mol)": "{:.2f}", "Ligand Efficiency": "{:.2f}"})
                 )
                 
-                # Download
                 csv = res_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download Full Physics Report",
-                    data=csv,
-                    file_name="nucligs_screening_results.csv",
-                    mime="text/csv"
-                )
+                st.download_button("📥 Download Results", csv, "screening_results.csv", "text/csv")
         else:
-            st.warning("No valid results generated. Check your input SMILES.")
+            st.warning("No valid results generated.")
