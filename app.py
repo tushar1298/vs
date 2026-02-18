@@ -2,19 +2,14 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
-import subprocess
-import shutil
 import requests
 import joblib
 
-from Bio.PDB import PDBParser, Select, PDBIO
+from Bio.PDB import PDBParser
 from scipy.spatial.distance import cdist
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors, Lipinski, rdMolDescriptors
-
-from meeko import MoleculePreparation
-from vina import Vina
 
 import py3Dmol
 from stmol import showmol
@@ -24,124 +19,178 @@ from stmol import showmol
 # CONFIGURATION
 # ============================================
 
-st.set_page_config(layout="wide", page_title="NucLigs Pro Ultra")
+st.set_page_config(layout="wide", page_title="NucLigs Pro Ultra — Physics Engine")
 
 TEMP = "dock_temp"
 os.makedirs(TEMP, exist_ok=True)
 
 
 # ============================================
-# CHECK GPU SUPPORT
+# PHYSICAL CONSTANTS
 # ============================================
 
-def check_gpu():
-
-    return shutil.which("autodock_gpu") is not None
-
-
-GPU_AVAILABLE = check_gpu()
+EPSILON = 0.2        # vdW depth
+SIGMA = 3.5          # vdW radius
+COULOMB_CONST = 332  # electrostatic constant
 
 
 # ============================================
-# AUTOMATIC POCKET DETECTION
+# RECEPTOR LOADER
 # ============================================
 
-def detect_pocket(structure):
+def load_receptor(pdb_file):
+
+    parser = PDBParser(QUIET=True)
+
+    structure = parser.get_structure("rec", pdb_file)
 
     coords = []
+    labels = []
 
-    for atom in structure.get_atoms():
+    for model in structure:
+        for chain in model:
+            for residue in chain:
 
-        if atom.get_parent().get_resname() != "HOH":
+                if residue.get_resname() == "HOH":
+                    continue
 
-            coords.append(atom.coord)
+                label = f"{residue.get_resname()}_{chain.id}_{residue.get_id()[1]}"
 
-    coords = np.array(coords)
+                for atom in residue:
 
-    center = coords.mean(axis=0)
+                    coords.append(atom.coord)
+                    labels.append(label)
 
-    size = coords.max(axis=0) - coords.min(axis=0)
+    return structure, np.array(coords), labels
 
-    box = size + 10
 
-    return center, box
+# ============================================
+# LIGAND GENERATOR
+# ============================================
+
+def generate_ligand(smiles):
+
+    mol = Chem.MolFromSmiles(smiles)
+
+    if mol is None:
+        return None, None
+
+    mol = Chem.AddHs(mol)
+
+    AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+
+    AllChem.MMFFOptimizeMolecule(mol)
+
+    coords = mol.GetConformer().GetPositions()
+
+    return mol, np.array(coords)
+
+
+# ============================================
+# PHYSICS ENERGY TERMS
+# ============================================
+
+def lennard_jones(rec, lig):
+
+    dist = cdist(lig, rec)
+
+    dist[dist < 0.1] = 0.1
+
+    term = (SIGMA/dist)**12 - (SIGMA/dist)**6
+
+    energy = np.sum(4 * EPSILON * term)
+
+    return energy
+
+
+def electrostatic(rec, lig):
+
+    dist = cdist(lig, rec)
+
+    dist[dist < 0.1] = 0.1
+
+    energy = np.sum(COULOMB_CONST / dist)
+
+    return energy
+
+
+def hydrogen_energy(rec, lig):
+
+    dist = cdist(lig, rec)
+
+    hbonds = np.sum(dist < 3.5)
+
+    return -1.5 * hbonds, hbonds
+
+
+def desolvation_energy(rec, lig):
+
+    dist = cdist(lig, rec)
+
+    buried = np.sum(dist < 5.0)
+
+    return -0.2 * buried
+
+
+def total_energy(rec, lig):
+
+    evdw = lennard_jones(rec, lig)
+
+    eelec = electrostatic(rec, lig)
+
+    ehb, hbcount = hydrogen_energy(rec, lig)
+
+    edes = desolvation_energy(rec, lig)
+
+    total = evdw + eelec + ehb + edes
+
+    return total, hbcount
+
+
+# ============================================
+# POSE SAMPLING
+# ============================================
+
+def sample_poses(lig_coords, center, nposes=50):
+
+    poses = []
+
+    lig_center = lig_coords.mean(axis=0)
+
+    lig_coords = lig_coords - lig_center
+
+    for i in range(nposes):
+
+        theta = np.random.uniform(0, 2*np.pi)
+
+        rot = np.array([
+            [np.cos(theta), -np.sin(theta), 0],
+            [np.sin(theta),  np.cos(theta), 0],
+            [0,0,1]
+        ])
+
+        pose = lig_coords @ rot.T
+
+        pose = pose + center
+
+        poses.append(pose)
+
+    return poses
 
 
 # ============================================
 # INTERACTION ANALYZER
 # ============================================
 
-class InteractionAnalyzer:
+def count_contacts(rec_coords, rec_labels, lig_coords, cutoff=4.0):
 
-    def __init__(self, structure, ligand_pdbqt):
+    dist = cdist(lig_coords, rec_coords)
 
-        self.rec_atoms = []
-        self.rec_labels = []
+    idx = np.where(dist < cutoff)[1]
 
-        for model in structure:
-            for chain in model:
-                for residue in chain:
+    residues = list(set(rec_labels[i] for i in idx))
 
-                    if residue.get_resname() == "HOH":
-                        continue
-
-                    label = f"{residue.get_resname()}_{chain.id}_{residue.get_id()[1]}"
-
-                    for atom in residue:
-
-                        self.rec_atoms.append(atom.coord)
-                        self.rec_labels.append(label)
-
-        self.rec_atoms = np.array(self.rec_atoms)
-
-        self.lig_atoms = []
-
-        for line in ligand_pdbqt.splitlines():
-
-            if line.startswith("ATOM") or line.startswith("HETATM"):
-
-                x = float(line[30:38])
-                y = float(line[38:46])
-                z = float(line[46:54])
-
-                self.lig_atoms.append([x,y,z])
-
-        self.lig_atoms = np.array(self.lig_atoms)
-
-
-    def contacts(self, cutoff=4.0):
-
-        if len(self.lig_atoms)==0:
-            return [],0
-
-        dist = cdist(self.lig_atoms, self.rec_atoms)
-
-        idx = np.where(dist < cutoff)
-
-        residues = list(set(self.rec_labels[i] for i in idx[1]))
-
-        return residues, len(residues)
-
-
-# ============================================
-# HYDROGEN BOND DETECTOR
-# ============================================
-
-class HydrogenBondDetector:
-
-    def __init__(self, lig, rec):
-
-        self.lig = lig
-        self.rec = rec
-
-
-    def detect(self, cutoff=3.5):
-
-        dist = cdist(self.lig, self.rec)
-
-        hb = np.where(dist < cutoff)
-
-        return len(hb[0])
+    return residues, len(residues)
 
 
 # ============================================
@@ -156,17 +205,17 @@ def ligand_props(mol, energy):
 
     heavy = mol.GetNumHeavyAtoms()
 
-    LE = (-energy/heavy) if heavy>0 else 0
+    LE = (-energy/heavy) if heavy > 0 else 0
 
     hbd = Lipinski.NumHDonors(mol)
     hba = Lipinski.NumHAcceptors(mol)
 
     violations = 0
 
-    if mw>500: violations+=1
-    if logp>5: violations+=1
-    if hbd>5: violations+=1
-    if hba>10: violations+=1
+    if mw > 500: violations += 1
+    if logp > 5: violations += 1
+    if hbd > 5: violations += 1
+    if hba > 10: violations += 1
 
     return mw, logp, tpsa, LE, violations
 
@@ -189,7 +238,6 @@ ML_MODEL = load_ml()
 def ml_score(features):
 
     if ML_MODEL is None:
-
         return sum(features)
 
     return ML_MODEL.predict([features])[0]
@@ -203,68 +251,27 @@ def confidence(energy, LE, contacts, hb, violations):
 
     score = 0
 
-    score += min((-energy)*4, 40)
+    score += min((-energy)*0.1, 40)
+
     score += min(LE*100, 25)
+
     score += min(contacts*2, 15)
+
     score += min(hb*2, 10)
 
-    if violations<=1:
+    if violations <= 1:
         score += 10
 
     return round(score,1)
 
 
 # ============================================
-# RECEPTOR PREPARATION
-# ============================================
-
-def prepare_receptor(pdb):
-
-    pdbqt = os.path.join(TEMP,"rec.pdbqt")
-
-    subprocess.run([
-        "obabel",
-        pdb,
-        "-O",
-        pdbqt,
-        "-xr",
-        "--partialcharge",
-        "gasteiger"
-    ])
-
-    return pdbqt
-
-
-# ============================================
-# DOCKING ENGINE
-# ============================================
-
-def dock_vina(rec_pdbqt, lig_pdbqt, center, box):
-
-    v = Vina()
-
-    v.set_receptor(rec_pdbqt)
-
-    v.set_ligand_from_string(lig_pdbqt)
-
-    v.compute_vina_maps(center=center, box_size=box)
-
-    v.dock(exhaustiveness=16, n_poses=5)
-
-    poses = v.poses(n_poses=5)
-
-    energies = v.energies(n_poses=5)
-
-    return poses[0], energies[0][0]
-
-
-# ============================================
 # STREAMLIT UI
 # ============================================
 
-st.title("NucLigs Pro Ultra — Scientific Docking Platform")
+st.title("NucLigs Pro Ultra — Physics-Based Virtual Screening")
 
-st.write("Publication-grade RNA/protein virtual screening")
+st.write("Fully physics- and biochemistry-based screening engine (No docking software used)")
 
 
 # LOAD LIGANDS
@@ -289,11 +296,11 @@ else:
 
 pdbid = st.text_input("Enter PDB ID","1UA2")
 
+pdb_path = os.path.join(TEMP,"rec.pdb")
+
 if st.button("Load Target"):
 
     url = f"https://files.rcsb.org/download/{pdbid}.pdb"
-
-    pdb_path = os.path.join(TEMP,"rec.pdb")
 
     r = requests.get(url)
 
@@ -304,11 +311,11 @@ if st.button("Load Target"):
 
 # VISUALIZATION
 
-if os.path.exists(os.path.join(TEMP,"rec.pdb")):
+if os.path.exists(pdb_path):
 
     view = py3Dmol.view(width=800,height=400)
 
-    view.addModel(open(os.path.join(TEMP,"rec.pdb")).read(),"pdb")
+    view.addModel(open(pdb_path).read(),"pdb")
 
     view.setStyle({"cartoon":{"color":"white"}})
 
@@ -319,58 +326,52 @@ if os.path.exists(os.path.join(TEMP,"rec.pdb")):
 
 # RUN SCREENING
 
-if st.button("Run Screening"):
+if st.button("Run Physics Screening"):
 
-    parser = PDBParser()
+    structure, rec_coords, rec_labels = load_receptor(pdb_path)
 
-    structure = parser.get_structure("rec", os.path.join(TEMP,"rec.pdb"))
-
-    center, box = detect_pocket(structure)
-
-    rec_pdbqt = prepare_receptor(os.path.join(TEMP,"rec.pdb"))
+    center = rec_coords.mean(axis=0)
 
     results = []
 
     for i,row in lig_df.iterrows():
 
-        mol = Chem.MolFromSmiles(row.smiles)
+        mol, lig_coords = generate_ligand(row.smiles)
 
-        mol = Chem.AddHs(mol)
+        if mol is None:
+            continue
 
-        AllChem.EmbedMolecule(mol)
+        poses = sample_poses(lig_coords, center)
 
-        prep = MoleculePreparation()
+        best_energy = 1e9
+        best_pose = None
+        best_hb = 0
 
-        prep.prepare(mol)
+        for pose in poses:
 
-        lig_pdbqt = prep.write_pdbqt_string()
+            energy, hb = total_energy(rec_coords, pose)
 
-        pose, energy = dock_vina(rec_pdbqt, lig_pdbqt, center, box)
+            if energy < best_energy:
 
-        analyzer = InteractionAnalyzer(structure, pose)
+                best_energy = energy
+                best_pose = pose
+                best_hb = hb
 
-        residues, contacts = analyzer.contacts()
+        residues, contacts = count_contacts(rec_coords, rec_labels, best_pose)
 
-        hb_detector = HydrogenBondDetector(
-            analyzer.lig_atoms,
-            analyzer.rec_atoms
-        )
+        mw, logp, tpsa, LE, violations = ligand_props(mol, best_energy)
 
-        hb = hb_detector.detect()
+        ml = ml_score([best_energy, LE, contacts, best_hb])
 
-        mw, logp, tpsa, LE, violations = ligand_props(mol, energy)
-
-        ml = ml_score([energy, LE, contacts, hb])
-
-        conf = confidence(energy, LE, contacts, hb, violations)
+        conf = confidence(best_energy, LE, contacts, best_hb, violations)
 
         results.append({
 
             "Name":row.name,
-            "Affinity":energy,
-            "LE":LE,
+            "Binding Energy":best_energy,
+            "Ligand Efficiency":LE,
             "Contacts":contacts,
-            "HBonds":hb,
+            "HBonds":best_hb,
             "ML Score":ml,
             "Confidence":conf,
             "MW":mw,
@@ -381,7 +382,7 @@ if st.button("Run Screening"):
 
     df = pd.DataFrame(results)
 
-    df = df.sort_values("Confidence",ascending=False)
+    df = df.sort_values("Confidence", ascending=False)
 
     st.dataframe(df)
 
@@ -391,5 +392,5 @@ if st.button("Run Screening"):
 
         df.to_csv(index=False),
 
-        "screening_results.csv"
+        "physics_screening_results.csv"
     )
