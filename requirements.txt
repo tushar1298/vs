@@ -15,4 +15,3 @@ ipython_genutils
 scikit-learn
 joblib
 streamlit-ketcher
-st-ketcher
