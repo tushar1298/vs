@@ -7,100 +7,157 @@ import subprocess
 import shutil
 from Bio.PDB import PDBParser, Select, PDBIO
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, Descriptors
 from meeko import MoleculePreparation
 from vina import Vina
 from stmol import showmol
 import py3Dmol
+from scipy.spatial import distance
 
 # --- CONFIGURATION ---
-st.set_page_config(layout="wide", page_title="NucLigs Explorer")
+st.set_page_config(layout="wide", page_title="NucLigs Pro: Bio-Physics Screener")
 
-# --- HELPER CLASSES ---
-class LigandSelect(Select):
-    """Biopython selector to filtering specific residues (to remove the native ligand)."""
-    def __init__(self, res_to_remove):
-        self.res_to_remove = res_to_remove # Format: (Chain, ResName, ResID)
+# --- ADVANCED PHYSICS & BIOLOGY CLASSES ---
+
+class InteractionAnalyzer:
+    """
+    Physics-based analysis of the binding pocket.
+    Calculates distances between Ligand heavy atoms and Receptor residues.
+    """
+    def __init__(self, receptor_structure, ligand_pdbqt_string):
+        self.receptor_atoms = []
+        self.receptor_residues = []
         
+        # 1. Parse Receptor Atoms (Heavy atoms only for speed)
+        for model in receptor_structure:
+            for chain in model:
+                for residue in chain:
+                    if residue.get_resname() != "HOH":
+                        for atom in residue:
+                            self.receptor_atoms.append(atom.get_coord())
+                            self.receptor_residues.append(f"{residue.get_resname()}{residue.get_id()[1]}")
+        self.receptor_coords = np.array(self.receptor_atoms)
+
+        # 2. Parse Ligand Atoms from Vina Output String
+        self.lig_coords = []
+        for line in ligand_pdbqt_string.split('\n'):
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                # PDBQT format: X is 30-38, Y is 38-46, Z is 46-54
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    self.lig_coords.append([x, y, z])
+                except ValueError:
+                    continue
+        self.lig_coords = np.array(self.lig_coords)
+
+    def get_interacting_residues(self, cutoff=3.5):
+        """Returns unique list of residues within 'cutoff' Angstroms of ligand."""
+        if len(self.lig_coords) == 0: return "Parsing Error"
+        
+        # Physics: Calculate Euclidean distance matrix
+        dists = distance.cdist(self.lig_coords, self.receptor_coords, 'euclidean')
+        
+        # Find receptor atoms within cutoff
+        interacting_indices = np.where(dists < cutoff)[1]
+        unique_residues = sorted(list(set([self.receptor_residues[i] for i in interacting_indices])))
+        
+        return ", ".join(unique_residues)
+
+def calculate_physchem_props(mol, score):
+    """
+    Calculates Ligand Efficiency (LE) and Lipinski Violations.
+    Physics-Based Metric: LE = -Score / Heavy_Atoms
+    """
+    mw = Descriptors.MolWt(mol)
+    logp = Descriptors.MolLogP(mol)
+    hbd = Descriptors.NumHDonors(mol)
+    hba = Descriptors.NumHAcceptors(mol)
+    heavy_atoms = mol.GetNumHeavyAtoms()
+    
+    # Physics-Based Metrics
+    le = (-score / heavy_atoms) if heavy_atoms > 0 else 0
+    
+    # Biological: Lipinski Rule of 5 Check
+    violations = 0
+    if mw > 500: violations += 1
+    if logp > 5: violations += 1
+    if hbd > 5: violations += 1
+    if hba > 10: violations += 1
+    
+    pass_lipinski = "✅" if violations <= 1 else "⚠️"
+    
+    return {
+        "MW": round(mw, 1),
+        "LogP": round(logp, 2),
+        "LE": round(le, 2),
+        "Lipinski": pass_lipinski
+    }
+
+# --- STANDARD CLASSES ---
+class LigandSelect(Select):
+    def __init__(self, res_to_remove):
+        self.res_to_remove = res_to_remove
     def accept_residue(self, residue):
-        # Check if this residue matches the one we want to remove
         res_id = residue.get_id()[1]
         chain_id = residue.get_parent().id
         res_name = residue.get_resname()
-        
-        if (chain_id, res_name, res_id) == self.res_to_remove:
-            return 0 # Remove this
-        return 1 # Keep everything else
+        if (chain_id, res_name, res_id) == self.res_to_remove: return 0
+        return 1
 
 def get_ligand_center(residue):
-    """Calculates the geometric center (centroid) of a residue."""
     coords = [atom.get_coord() for atom in residue]
     return np.mean(coords, axis=0)
 
 def check_openbabel():
-    """Checks if OpenBabel is installed and accessible."""
     return shutil.which("obabel") is not None
 
 # --- MAIN APP ---
-st.title("🧬 NucLigs: Virtual Screening Tool")
-st.markdown("""
-**Workflow:**
-1. Upload your Nucleotide Analog Library (Excel).
-2. Input a PDB ID (Target).
-3. Select the bound ligand to define the binding pocket.
-4. Run Docking.
-""")
+st.title("🧬 NucLigs Pro: Bio-Physics Screening")
+st.markdown("Advanced screening with **Interaction Fingerprinting** and **Ligand Efficiency** analysis.")
 
-# Check for OpenBabel
 if not check_openbabel():
-    st.error("⚠️ System Error: 'openbabel' is not installed. If on Streamlit Cloud, ensure 'packages.txt' contains 'openbabel', 'libboost-all-dev', 'swig', and 'build-essential'.")
+    st.error("⚠️ System Error: OpenBabel missing. Add 'openbabel', 'libboost-all-dev', 'swig', 'build-essential' to packages.txt")
 
-# 1. SIDEBAR: DATA INPUT
+# 1. SIDEBAR
 with st.sidebar:
-    st.header("1. Input Data")
-    
-    # Upload Excel
-    uploaded_file = st.file_uploader("Upload 'nucligs_metadata.xlsx'", type=['xlsx'])
-    
+    st.header("1. NucLigs Library")
+    uploaded_file = st.file_uploader("Upload Metadata (Excel)", type=['xlsx'])
     if uploaded_file:
         df = pd.read_excel(uploaded_file)
-        st.success(f"Loaded {len(df)} analogs.")
-        # Normalize column names
         df.columns = [c.lower() for c in df.columns]
         if 'smiles' not in df.columns:
             st.error("Excel must have a 'smiles' column.")
             st.stop()
     else:
-        st.info("Using Demo Data (Upload Excel to override)")
-        # Demo: Gemcitabine and Remdesivir analogs
+        st.info("Using Demo Data")
         df = pd.DataFrame({
-            'name': ['Gemcitabine Analog', 'Remdesivir Metabolite'],
+            'name': ['Gemcitabine Analog', 'Remdesivir Metabolite', 'High MW Control'],
             'smiles': [
                 'NC1=NC(=O)N(C=C1)C2C(C(C(O2)CO)O)(F)F', 
-                'Nc1ccn([C@@H]2O[C@H](CO)[C@@H](O)[C@H]2O)c(=O)n1'
+                'Nc1ccn([C@@H]2O[C@H](CO)[C@@H](O)[C@H]2O)c(=O)n1',
+                'CC1=CC=C(C=C1)S(=O)(=O)NC(=O)NC2=CC=C(C=C2)C3=CC=CC=C3' # Random larger mol
             ]
         })
-
+    
     st.divider()
-    st.header("3. Screening Settings")
-    exhaustiveness = st.slider("Exhaustiveness (Accuracy)", 1, 16, 4) # Lower default for cloud speed
-    n_poses = st.slider("Num Poses", 1, 5, 1)
+    st.header("3. Physics Settings")
+    exhaustiveness = st.slider("Docking Precision (Exhaustiveness)", 1, 32, 8, help="Higher = more accurate but slower.")
+    contact_cutoff = st.slider("Interaction Cutoff (Å)", 2.5, 5.0, 4.0, help="Distance to define a residue contact.")
 
-# 2. PDB FETCHING & PARSING
-st.header("2. Target Preparation")
-pdb_id = st.text_input("Enter PDB ID (e.g., 1UA2 for HIV-RT):", "1UA2").strip().lower()
+# 2. TARGET PREP
+st.header("2. Target & Pocket Definition")
+pdb_id = st.text_input("PDB ID:", "1UA2").strip().lower()
 
 if pdb_id:
-    # Use a temporary directory for processing
     temp_dir = "temp_docking"
     os.makedirs(temp_dir, exist_ok=True)
-    
     pdb_path = os.path.join(temp_dir, "target.pdb")
     
     # Fetch PDB
     if not os.path.exists(pdb_path):
-        pdb_url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
-        response = requests.get(pdb_url)
+        response = requests.get(f"https://files.rcsb.org/download/{pdb_id}.pdb")
         if response.status_code == 200:
             with open(pdb_path, "w") as f:
                 f.write(response.text)
@@ -108,142 +165,131 @@ if pdb_id:
             st.error("Invalid PDB ID")
             st.stop()
             
-    # Parse PDB
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure('Target', pdb_path)
     
-    # Extract Ligands
     ligand_list = []
     for model in structure:
         for chain in model:
             for residue in chain:
                 if residue.get_id()[0].startswith('H_') and residue.get_resname() != 'HOH':
-                    center = get_ligand_center(residue)
                     ligand_list.append({
-                        'Display': f"{residue.get_resname()} (Chain {chain.id}, ID {residue.get_id()[1]})",
+                        'Display': f"{residue.get_resname()} (Chain {chain.id} {residue.get_id()[1]})",
                         'Value': (chain.id, residue.get_resname(), residue.get_id()[1]),
-                        'Center': center
+                        'Center': get_ligand_center(residue)
                     })
     
     if not ligand_list:
-        st.warning("No ligands found to define binding site.")
+        st.warning("No bound ligands found in PDB to define pocket.")
     else:
-        st.subheader("Select Binding Pocket")
-        selected_ligand_idx = st.selectbox(
-            "Choose the bound ligand to remove & target:",
-            range(len(ligand_list)),
-            format_func=lambda x: ligand_list[x]['Display']
-        )
-        
+        selected_ligand_idx = st.selectbox("Select Bound Ligand (Pocket Center):", range(len(ligand_list)), format_func=lambda x: ligand_list[x]['Display'])
         target_ligand = ligand_list[selected_ligand_idx]
         center = target_ligand['Center']
         
-        col1, col2 = st.columns(2)
-        with col1:
-            st.info(f"**Grid Center:**\nX: {center[0]:.2f}, Y: {center[1]:.2f}, Z: {center[2]:.2f}")
-        with col2:
-            box_size = st.number_input("Box Size (Å)", value=20.0)
-
-        # Draw 3D Box
+        # VISUALIZATION
         view = py3Dmol.view(width=800, height=400)
         view.addModel(open(pdb_path).read(), 'pdb')
         view.setStyle({'cartoon': {'color': 'white'}})
         view.addStyle({'resn': target_ligand['Value'][1], 'resi': target_ligand['Value'][2]}, {'stick': {'colorscheme': 'greenCarbon', 'radius': 0.5}})
         
-        # --- SAFE FLOAT CONVERSION ---
-        # Explicitly convert numpy floats to standard python floats for JSON serialization
-        safe_center = {
-            'x': float(center[0]), 
-            'y': float(center[1]), 
-            'z': float(center[2])
-        }
-        
-        view.addBox({
-            'center': safe_center, 
-            'dimensions': {'w': box_size, 'h': box_size, 'd': box_size}, 
-            'color': 'red', 
-            'opacity': 0.5
-        })
-        # -----------------------------
-        
+        # Safe float conversion for JSON
+        safe_center = {'x': float(center[0]), 'y': float(center[1]), 'z': float(center[2])}
+        view.addBox({'center': safe_center, 'dimensions': {'w':20, 'h':20, 'd':20}, 'color':'red', 'opacity': 0.5})
         view.zoomTo()
         showmol(view, height=400, width=800)
 
-        # --- EXECUTION ---
-        if st.button("🚀 Run Virtual Screening"):
-            results_placeholder = st.empty()
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        if st.button("🚀 Run Bio-Physics Screening"):
+            status = st.empty()
+            progress = st.progress(0)
             
-            # A. Remove Ligand & Save Clean PDB
-            clean_pdb_path = os.path.join(temp_dir, "receptor_clean.pdb")
-            receptor_pdbqt_path = os.path.join(temp_dir, "receptor.pdbqt")
-            
+            # Prep Receptor
+            clean_path = os.path.join(temp_dir, "receptor_clean.pdb")
+            pdbqt_path = os.path.join(temp_dir, "receptor.pdbqt")
             io = PDBIO()
             io.set_structure(structure)
-            io.save(clean_pdb_path, LigandSelect(target_ligand['Value']))
+            io.save(clean_path, LigandSelect(target_ligand['Value']))
             
-            # B. Convert PDB -> PDBQT using OpenBabel
-            status_text.text("Preparing Receptor (OpenBabel)...")
-            cmd = [
-                "obabel", clean_pdb_path, 
-                "-O", receptor_pdbqt_path, 
-                "-xr", "--partialcharge", "gasteiger"
-            ]
             try:
-                subprocess.run(cmd, check=True)
-            except subprocess.CalledProcessError:
-                st.error("Failed to convert receptor to PDBQT. Ensure OpenBabel is installed.")
+                subprocess.run(["obabel", clean_path, "-O", pdbqt_path, "-xr", "--partialcharge", "gasteiger"], check=True)
+            except Exception as e:
+                st.error("Receptor preparation failed. Is OpenBabel installed?")
                 st.stop()
-
-            results_table = []
             
-            # C. Loop through NucLigs
-            total_mols = len(df)
+            results = []
+            
             for i, row in df.iterrows():
                 name = row.get('name', f"Mol_{i}")
                 smi = row.get('smiles')
                 
-                status_text.text(f"Docking: {name}")
+                status.text(f"Analyzing: {name}")
                 
                 try:
-                    # RDKit Setup
                     mol = Chem.MolFromSmiles(smi)
                     if mol:
                         mol = Chem.AddHs(mol)
-                        AllChem.EmbedMolecule(mol)
+                        # Increased maxAttempts for complex nucleosides
+                        if AllChem.EmbedMolecule(mol, maxAttempts=5000) == -1:
+                             # Fallback: Compute 2D coords if 3D fails (rare but possible)
+                             AllChem.Compute2DCoords(mol)
                         
-                        # Meeko PDBQT prep
+                        # Meeko Prep
                         meeko_prep = MoleculePreparation()
                         meeko_prep.prepare(mol)
-                        ligand_pdbqt = meeko_prep.write_pdbqt_string()
+                        lig_pdbqt = meeko_prep.write_pdbqt_string()
                         
-                        # Vina Docking
+                        # Docking
                         v = Vina(sf_name='vina')
-                        v.set_receptor(receptor_pdbqt_path)
-                        v.set_ligand_from_string(ligand_pdbqt)
-                        v.compute_vina_maps(center=center, box_size=[box_size, box_size, box_size])
-                        v.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)
+                        v.set_receptor(pdbqt_path)
+                        v.set_ligand_from_string(lig_pdbqt)
+                        v.compute_vina_maps(center=center, box_size=[20, 20, 20])
+                        v.dock(exhaustiveness=exhaustiveness, n_poses=1)
                         
+                        # 1. Physics: Raw Energy
                         score = v.score()[0]
-                        results_table.append({'Name': name, 'Affinity (kcal/mol)': score, 'SMILES': smi})
+                        docked_pdbqt = v.poses(n_poses=1)
+                        
+                        # 2. Physics: Ligand Efficiency & Lipinski
+                        props = calculate_physchem_props(mol, score)
+                        
+                        # 3. Biology: Interaction Fingerprint
+                        analyzer = InteractionAnalyzer(structure, docked_pdbqt)
+                        contacts = analyzer.get_interacting_residues(cutoff=contact_cutoff)
+                        
+                        results.append({
+                            'Name': name,
+                            'Affinity (kcal/mol)': score,
+                            'Ligand Efficiency': props['LE'], # Higher is better (>0.3)
+                            'Lipinski Pass': props['Lipinski'],
+                            'Interacting Residues': contacts,
+                            'MW': props['MW'],
+                            'LogP': props['LogP']
+                        })
                     else:
-                        st.warning(f"Invalid SMILES for {name}")
-                    
+                        st.warning(f"Skipping invalid SMILES: {name}")    
                 except Exception as e:
-                    print(f"Error docking {name}: {e}")
+                    print(f"Docking failed for {name}: {e}")
                 
-                progress_bar.progress((i + 1) / total_mols)
+                progress.progress((i+1)/len(df))
             
-            status_text.text("Done!")
-            
-            if results_table:
-                res_df = pd.DataFrame(results_table).sort_values(by='Affinity (kcal/mol)')
-                st.subheader("Results")
-                st.dataframe(res_df)
+            status.success("Analysis Complete!")
+            if results:
+                res_df = pd.DataFrame(results).sort_values(by='Affinity (kcal/mol)')
+                
+                st.subheader("High-Confidence Results")
+                st.markdown("""
+                **Interpretation Guide:**
+                1. **Affinity:** Binding strength (more negative is better).
+                2. **Ligand Efficiency (LE):** Quality of binding. **Target > 0.3**.
+                3. **Lipinski Pass:** Checks oral drug-likeness.
+                4. **Interactions:** Ensure these match the active site residues (e.g., catalytic triad).
+                """)
+                
+                # Stylized dataframe
+                st.dataframe(
+                    res_df.style.background_gradient(subset=['Ligand Efficiency'], cmap='Greens')
+                          .format({"Affinity (kcal/mol)": "{:.2f}", "Ligand Efficiency": "{:.2f}"})
+                )
                 
                 # Download CSV
                 csv = res_df.to_csv(index=False).encode('utf-8')
-                st.download_button("Download Results CSV", csv, "docking_results.csv", "text/csv")
-            else:
-                st.warning("No docking results generated.")
+                st.download_button("Download Full Report", csv, "docking_report.csv", "text/csv")
