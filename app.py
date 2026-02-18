@@ -5,7 +5,7 @@ import os
 import subprocess
 import shutil
 import requests
-from io import BytesIO
+from io import BytesIO, StringIO
 from scipy.spatial import distance
 
 # Bioinformatics & Chemistry
@@ -18,6 +18,7 @@ from vina import Vina
 # Visualization
 import py3Dmol
 from stmol import showmol
+from streamlit_ketcher import st_ketcher
 
 # ============================================
 # 1. CONFIGURATION & CONSTANTS
@@ -155,50 +156,102 @@ def calculate_properties(mol, affinity):
 st.title("🧬 NucLigs Pro: Bio-Physics Screening Engine")
 st.markdown("A high-precision tool for virtual screening of nucleotide analogs using **AutoDock Vina**.")
 
-check_system_dependencies()
+# Uncomment this line if you have OpenBabel installed on the system
+# check_system_dependencies()
 
 # --- SIDEBAR: INPUTS ---
 with st.sidebar:
     st.header("1. Library Input")
-    uploaded_file = st.file_uploader("Upload Library (Excel, CSV, TXT)", type=['xlsx', 'csv', 'txt'])
     
-    if uploaded_file:
-        try:
-            file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-            if file_ext == '.xlsx':
-                df = pd.read_excel(uploaded_file)
-            else:
-                df = pd.read_csv(uploaded_file, sep=None, engine='python')
-                
-            df.columns = [str(c).lower().strip() for c in df.columns]
-            
-            if 'smiles' not in df.columns:
-                if len(df.columns) == 1:
-                    df.columns = ['smiles']
-                    st.info("ℹ️ No header found. Assuming single column is SMILES.")
+    # INPUT METHOD SELECTOR
+    input_method = st.radio(
+        "Choose Input Method:", 
+        ["📂 Upload File", "📝 Paste List", "✏️ Draw Structure"]
+    )
+    
+    df = None # Initialize dataframe
+
+    # --- OPTION A: UPLOAD FILE ---
+    if input_method == "📂 Upload File":
+        uploaded_file = st.file_uploader("Upload (Excel, CSV, TXT)", type=['xlsx', 'csv', 'txt'])
+        if uploaded_file:
+            try:
+                file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+                if file_ext == '.xlsx':
+                    df = pd.read_excel(uploaded_file)
                 else:
-                    st.error("❌ Input file must contain a 'smiles' column.")
-                    st.stop()
-            st.success(f"✅ Loaded {len(df)} molecules.")
+                    df = pd.read_csv(uploaded_file, sep=None, engine='python')
+                
+                # Normalize columns
+                df.columns = [str(c).lower().strip() for c in df.columns]
+                if 'smiles' not in df.columns:
+                    if len(df.columns) == 1:
+                        df.columns = ['smiles']
+                    else:
+                        st.error("❌ File must contain a 'smiles' column.")
+                        df = None
+            except Exception as e:
+                st.error(f"❌ Error: {e}")
+
+    # --- OPTION B: PASTE TEXT ---
+    elif input_method == "📝 Paste List":
+        st.caption("Paste SMILES (one per line). Optional: 'Name, SMILES'")
+        paste_data = st.text_area("Input Data", height=200, 
+                                placeholder="Gemcitabine, NC1=NC(=O)N(C=C1)\nCCO")
+        
+        if paste_data:
+            data_list = []
+            for line in paste_data.split('\n'):
+                line = line.strip()
+                if not line: continue
+                
+                parts = line.split(',')
+                if len(parts) >= 2:
+                    # Assume format: Name, SMILES
+                    data_list.append({'name': parts[0].strip(), 'smiles': parts[1].strip()})
+                else:
+                    # Assume format: SMILES only
+                    data_list.append({'name': f"Mol_{len(data_list)+1}", 'smiles': parts[0].strip()})
             
-        except Exception as e:
-            st.error(f"❌ Error reading file: {e}")
-            st.stop()
+            if data_list:
+                df = pd.DataFrame(data_list)
+
+    # --- OPTION C: DRAW STRUCTURE (KETCHER) ---
+    elif input_method == "✏️ Draw Structure":
+        st.caption("Draw your molecule below:")
+        
+        # Ketcher Editor
+        # Default is Benzene if nothing is drawn yet
+        drawn_smiles = st_ketcher("c1ccccc1")
+        
+        col_name, col_add = st.columns([2, 1])
+        with col_name:
+            mol_name = st.text_input("Molecule Name", "Drawn_Ligand_01")
+        
+        if drawn_smiles:
+            st.success(f"SMILES: `{drawn_smiles}`")
+            # Create a 1-row DataFrame
+            df = pd.DataFrame([{'name': mol_name, 'smiles': drawn_smiles}])
+
+    # --- INPUT SUMMARY ---
+    if df is not None:
+        st.success(f"✅ Loaded {len(df)} molecules")
+        with st.expander("Preview Library"):
+            st.dataframe(df.head())
     else:
-        st.info("Using Demo Library")
+        # Fallback to Demo Data if nothing is provided
+        st.info("Using Demo Library (Default)")
         df = pd.DataFrame({
-            'name': ['Gemcitabine Analog', 'Remdesivir Metabolite', 'ATP Analog'],
+            'name': ['Gemcitabine Analog', 'Remdesivir Metabolite'],
             'smiles': [
                 'NC1=NC(=O)N(C=C1)C2C(C(C(O2)CO)O)(F)F', 
-                'Nc1ccn([C@@H]2O[C@H](CO)[C@@H](O)[C@H]2O)c(=O)n1',
-                'NC1=C2N=CN(C2=NC=N1)C3OC(COP(=O)(O)O)C(O)C3O'
+                'Nc1ccn([C@@H]2O[C@H](CO)[C@@H](O)[C@H]2O)c(=O)n1'
             ]
         })
 
     st.divider()
-    st.header("3. Docking Strategy")
     
-    # DOCKING MODE SELECTOR
+    st.header("3. Docking Strategy")
     docking_mode = st.radio(
         "Screening Mode", 
         ["Active Site (Ligand-Guided)", "Blind Docking (Whole Surface)"],
@@ -343,7 +396,7 @@ if pdb_input:
                 "obabel", clean_pdb, "-O", receptor_pdbqt, "-xr", "--partialcharge", "gasteiger"
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
-            st.error("OpenBabel conversion failed.")
+            st.error("OpenBabel conversion failed. Make sure 'openbabel' is installed in packages.txt")
             st.stop()
 
         # B. DOCKING LOOP
