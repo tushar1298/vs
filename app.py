@@ -179,24 +179,45 @@ st.header("2. Target Preparation")
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    pdb_id = st.text_input("PDB ID:", "1UA2", help="4-letter PDB code (e.g., 1UA2 for HIV-RT)").strip().lower()
+    pdb_input = st.text_input("PDB ID:", "1UA2", help="Enter 4-letter PDB code").strip().lower()
 
-if pdb_id:
-    pdb_path = os.path.join(TEMP_DIR, "target.pdb")
+if pdb_input:
+    # Use dynamic filename based on input ID to prevent caching old files
+    pdb_filename = f"{pdb_input}.pdb"
+    pdb_path = os.path.join(TEMP_DIR, pdb_filename)
     
     # Fetch PDB
     if not os.path.exists(pdb_path):
-        with st.spinner(f"Fetching {pdb_id.upper()} from RCSB..."):
-            r = requests.get(f"https://files.rcsb.org/download/{pdb_id}.pdb")
-            if r.status_code != 200:
-                st.error("Invalid PDB ID.")
+        with st.spinner(f"Downloading {pdb_input.upper()} from RCSB..."):
+            try:
+                # Add headers to mimic a browser
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                r = requests.get(f"https://files.rcsb.org/download/{pdb_input}.pdb", headers=headers)
+                
+                if r.status_code != 200:
+                    st.error(f"❌ Error: Could not find PDB ID '{pdb_input.upper()}' on RCSB.")
+                    st.stop()
+                
+                # Check for valid PDB content
+                if "HEADER" not in r.text[:100] and "ATOM" not in r.text[:1000]:
+                     st.error("❌ Invalid file format received from RCSB.")
+                     st.stop()
+
+                with open(pdb_path, "w") as f:
+                    f.write(r.text)
+                    
+            except Exception as e:
+                st.error(f"Connection Error: {e}")
                 st.stop()
-            with open(pdb_path, "w") as f:
-                f.write(r.text)
     
     # Parse Structure
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure('Target', pdb_path)
+    try:
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure(pdb_input, pdb_path)
+    except Exception:
+        st.error("❌ Failed to parse PDB file. It might be corrupt.")
+        if os.path.exists(pdb_path): os.remove(pdb_path)
+        st.stop()
     
     # Identify Potential Pockets (Bound Ligands)
     ligands = []
@@ -204,15 +225,17 @@ if pdb_id:
         for chain in model:
             for res in chain:
                 # H_ prefix denotes Heteroatom (ligand/water)
-                if res.get_id()[0].startswith('H_') and res.get_resname() != 'HOH':
+                # Exclude common non-ligands like HOH (water), PO4, SO4, etc.
+                if res.get_id()[0].startswith('H_') and res.get_resname() not in ['HOH', 'DOD', 'PO4', 'SO4']:
                     ligands.append({
-                        'display': f"{res.get_resname()} (Chain {chain.id})",
+                        'display': f"{res.get_resname()} (Chain {chain.id} {res.get_id()[1]})",
                         'id': (chain.id, res.get_resname(), res.get_id()[1]),
                         'center': get_geometric_center(res)
                     })
     
     if not ligands:
-        st.warning("No bound ligands found. Docking will require manual grid coordinates.")
+        st.warning(f"No bound ligands found in {pdb_input.upper()}.")
+        st.info("The tool currently requires a bound ligand to define the docking center automatically.")
         st.stop()
 
     with col2:
@@ -229,14 +252,17 @@ if pdb_id:
         view = py3Dmol.view(width=800, height=400)
         view.addModel(open(pdb_path).read(), 'pdb')
         view.setStyle({'cartoon': {'color': 'white'}})
+        
         # Highlight Active Site Ligand
         view.addStyle(
             {'resn': target_site['id'][1], 'resi': target_site['id'][2], 'chain': target_site['id'][0]}, 
             {'stick': {'colorscheme': 'greenCarbon', 'radius': 0.5}}
         )
-        # Show Search Box
+        
+        # Show Search Box (Safe Float Conversion for JSON)
+        safe_center = {'x': float(center[0]), 'y': float(center[1]), 'z': float(center[2])}
         view.addBox({
-            'center': {'x': float(center[0]), 'y': float(center[1]), 'z': float(center[2])}, 
+            'center': safe_center, 
             'dimensions': {'w': box_padding, 'h': box_padding, 'd': box_padding}, 
             'color': 'red', 'opacity': 0.4
         })
