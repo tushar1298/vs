@@ -12,3 +12,5 @@ requests
 scipy
 gemmi
 ipython_genutils
+scikit-learn
+joblib
